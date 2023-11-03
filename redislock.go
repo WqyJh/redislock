@@ -53,7 +53,11 @@ func New(client RedisClient) *Client {
 
 // Obtain tries to obtain a new lock using a key with the given TTL.
 // May return ErrNotObtained if not successful.
-func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt *Options) (*Lock, error) {
+func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt *Options) (_ *Lock, err error) {
+	defer func() {
+		recordStatus(&stats.Obtain, err)
+	}()
+
 	token := opt.getToken()
 
 	// Create a random token
@@ -68,20 +72,18 @@ func (c *Client) Obtain(ctx context.Context, key string, ttl time.Duration, opt 
 	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
 	retry := opt.getRetryStrategy()
 
-	// make sure we don't retry forever
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(ttl))
-		defer cancel()
-	}
-
 	var ticker *time.Ticker
 	for {
 		ok, err := c.obtain(ctx, key, value, len(token), ttlVal)
 		if err != nil {
 			return nil, err
 		} else if ok {
-			return &Lock{Client: c, key: key, value: value, tokenLen: len(token)}, nil
+			lock := &Lock{Client: c, key: key, value: value, tokenLen: len(token)}
+			watchdog := opt.getWatchdog()
+			if watchdog != nil {
+				go watchdog.Start(ctx, lock, ttl)
+			}
+			return lock, nil
 		}
 
 		backoff := retry.NextBackoff()
@@ -136,6 +138,7 @@ type Lock struct {
 	key      string
 	value    string
 	tokenLen int
+	opt      *Options
 }
 
 // Obtain is a short-cut for New(...).Obtain(...).
@@ -175,7 +178,11 @@ func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
 
 // Refresh extends the lock with a new TTL.
 // May return ErrNotObtained if refresh is unsuccessful.
-func (l *Lock) Refresh(ctx context.Context, ttl time.Duration, opt *Options) error {
+func (l *Lock) Refresh(ctx context.Context, ttl time.Duration, opt *Options) (err error) {
+	defer func() {
+		recordStatus(&stats.Refresh, err)
+	}()
+
 	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
 	status, err := luaRefresh.Run(ctx, l.client, []string{l.key}, l.value, ttlVal).Result()
 	if err != nil {
@@ -188,9 +195,18 @@ func (l *Lock) Refresh(ctx context.Context, ttl time.Duration, opt *Options) err
 
 // Release manually releases the lock.
 // May return ErrLockNotHeld.
-func (l *Lock) Release(ctx context.Context) error {
+func (l *Lock) Release(ctx context.Context) (err error) {
+	defer func() {
+		recordStatus(&stats.Release, err)
+	}()
+
 	if l == nil {
 		return ErrLockNotHeld
+	}
+
+	dog := l.opt.getWatchdog()
+	if dog != nil {
+		dog.Stop()
 	}
 
 	res, err := luaRelease.Run(ctx, l.client, []string{l.key}, l.value).Result()
@@ -214,12 +230,15 @@ type Options struct {
 	// Default: do not retry
 	RetryStrategy RetryStrategy
 
-	// Metadata string.
+	// Metadata string is appended to the lock token.
 	Metadata string
 
 	// Token is a unique value that is used to identify the lock. By default, a random tokens are generated. Use this
 	// option to provide a custom token instead.
 	Token string
+
+	// Watchdog allows to refresh atomatically.
+	Watchdog Watchdog
 }
 
 func (o *Options) getMetadata() string {
@@ -234,6 +253,13 @@ func (o *Options) getToken() string {
 		return o.Token
 	}
 	return ""
+}
+
+func (o *Options) getWatchdog() Watchdog {
+	if o != nil && o.Watchdog != nil {
+		return o.Watchdog
+	}
+	return nil
 }
 
 func (o *Options) getRetryStrategy() RetryStrategy {
@@ -313,4 +339,75 @@ func (r *exponentialBackoff) NextBackoff() time.Duration {
 	} else {
 		return d
 	}
+}
+
+func isCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func recordStatus(s *Status, err error) {
+	if err == nil {
+		atomic.AddInt64(&s.Success, 1)
+	}
+	if err == ErrNotObtained {
+		atomic.AddInt64(&s.Failed, 1)
+	} else if isCanceled(err) {
+		atomic.AddInt64(&s.Cancel, 1)
+	} else {
+		atomic.AddInt64(&s.Error, 1)
+	}
+}
+
+// --------------------------------------------------------------------
+
+type Watchdog interface {
+	Start(ctx context.Context, lock *Lock, ttl time.Duration)
+	Stop()
+}
+
+type TickWatchdog struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	interval time.Duration
+	ch       chan struct{}
+}
+
+func NewTickWatchdog(interval time.Duration) *TickWatchdog {
+	return &TickWatchdog{interval: interval, ch: make(chan struct{})}
+}
+
+// Run starts the watchdog.
+func (w *TickWatchdog) Start(ctx context.Context, lock *Lock, ttl time.Duration) {
+	defer close(w.ch)
+	atomic.AddInt64(&stats.Watchdog, 1)
+
+	w.ctx, w.cancel = context.WithCancel(ctx)
+
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			atomic.AddInt64(&stats.WatchdogDone, 1)
+			return
+		case <-ticker.C:
+			atomic.AddInt64(&stats.WatchdogTick, 1)
+
+			err := lock.Refresh(w.ctx, ttl, nil)
+			if err != nil {
+				if err == ErrNotObtained {
+					return
+				}
+				// continue on other errors
+			}
+		}
+	}
+}
+
+func (w *TickWatchdog) Stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+	<-w.ch
 }
