@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -83,12 +84,7 @@ func (c *Client) ObtainMulti(ctx context.Context, keys []string, ttl time.Durati
 	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
 	retry := opt.getRetryStrategy()
 
-	// make sure we don't retry forever
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(ttl))
-		defer cancel()
-	}
+	oldctx := ctx
 
 	var ticker *time.Ticker
 	for {
@@ -96,7 +92,12 @@ func (c *Client) ObtainMulti(ctx context.Context, keys []string, ttl time.Durati
 		if err != nil {
 			return nil, err
 		} else if ok {
-			return &Lock{Client: c, keys: keys, value: value, tokenLen: len(token)}, nil
+			lock := &Lock{Client: c, keys: keys, value: value, tokenLen: len(token), opt: opt}
+			watchdog := opt.getWatchdog()
+			if watchdog != nil {
+				go watchdog.Start(oldctx, lock, ttl)
+			}
+			return lock, nil
 		}
 
 		backoff := retry.NextBackoff()
@@ -152,6 +153,7 @@ type Lock struct {
 	keys     []string
 	value    string
 	tokenLen int
+	opt      *Options
 }
 
 // Obtain is a short-cut for New(...).Obtain(...).
@@ -191,7 +193,7 @@ func (l *Lock) TTL(ctx context.Context) (time.Duration, error) {
 	if l == nil {
 		return 0, ErrLockNotHeld
 	}
-	res, err := luaPTTL.Run(ctx, l.client, l.keys, l.value).Result()
+	res, err := runScript(ctx, l.client, luaPTTL, l.keys, l.value).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return 0, nil
@@ -211,7 +213,7 @@ func (l *Lock) Refresh(ctx context.Context, ttl time.Duration, opt *Options) err
 		return ErrNotObtained
 	}
 	ttlVal := strconv.FormatInt(int64(ttl/time.Millisecond), 10)
-	_, err := luaRefresh.Run(ctx, l.client, l.keys, l.value, ttlVal).Result()
+	_, err := runScript(ctx, l.client, luaRefresh, l.keys, l.value, ttlVal).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return ErrNotObtained
@@ -227,7 +229,13 @@ func (l *Lock) Release(ctx context.Context) error {
 	if l == nil {
 		return ErrLockNotHeld
 	}
-	_, err := luaRelease.Run(ctx, l.client, l.keys, l.value).Result()
+
+	dog := l.opt.getWatchdog()
+	if dog != nil {
+		defer dog.Stop()
+	}
+
+	_, err := runScript(ctx, l.client, luaRelease, l.keys, l.value).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return ErrLockNotHeld
@@ -245,12 +253,16 @@ type Options struct {
 	// Default: do not retry
 	RetryStrategy RetryStrategy
 
-	// Metadata string.
+	// Metadata string is appended to the lock token.
 	Metadata string
 
 	// Token is a unique value that is used to identify the lock. By default, a random tokens are generated. Use this
 	// option to provide a custom token instead.
 	Token string
+
+	Watchdog Watchdog
+
+	Logger *slog.Logger
 }
 
 func (o *Options) getMetadata() string {
@@ -267,11 +279,25 @@ func (o *Options) getToken() string {
 	return ""
 }
 
+func (o *Options) getWatchdog() Watchdog {
+	if o != nil && o.Watchdog != nil {
+		return o.Watchdog
+	}
+	return nil
+}
+
 func (o *Options) getRetryStrategy() RetryStrategy {
 	if o != nil && o.RetryStrategy != nil {
 		return o.RetryStrategy
 	}
 	return NoRetry()
+}
+
+func (o *Options) getLogger() *slog.Logger {
+	if o != nil && o.Logger != nil {
+		return o.Logger
+	}
+	return DiscardLogger()
 }
 
 // --------------------------------------------------------------------
@@ -345,3 +371,61 @@ func (r *exponentialBackoff) NextBackoff() time.Duration {
 		return d
 	}
 }
+
+// --------------------------------------------------------------------
+
+type Watchdog interface {
+	Start(ctx context.Context, lock *Lock, ttl time.Duration)
+	Stop()
+}
+
+type TickWatchdog struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	interval time.Duration
+	ch       chan struct{}
+}
+
+func NewTickWatchdog(interval time.Duration) *TickWatchdog {
+	return &TickWatchdog{interval: interval, ch: make(chan struct{})}
+}
+
+// Run starts the watchdog.
+func (w *TickWatchdog) Start(ctx context.Context, lock *Lock, ttl time.Duration) {
+	defer close(w.ch)
+
+	w.ctx, w.cancel = context.WithCancel(ctx)
+
+	ticker := time.NewTicker(w.interval)
+	defer ticker.Stop()
+
+	logger := lock.opt.getLogger().With("keys", lock.keys)
+
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+
+			err := lock.Refresh(w.ctx, ttl, nil)
+			if err != nil {
+				if err == ErrNotObtained {
+					return
+				}
+				// ignore other errors
+				logger.ErrorContext(w.ctx, "refresh lock error", slog.Any("err", err))
+			} else {
+				// logger.Debug("refresh lock success")
+			}
+		}
+	}
+}
+
+func (w *TickWatchdog) Stop() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+	<-w.ch
+}
+
+// --------------------------------------------------------------------

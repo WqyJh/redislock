@@ -94,6 +94,35 @@ func TestObtain_metadata(t *testing.T) {
 	}
 }
 
+func TestObtain_watchdog(t *testing.T) {
+	lockKey := getLockKey()
+	ctx := context.Background()
+	rc := redis.NewClient(redisOpts)
+	defer teardown(t, rc)
+
+	lock, err := Obtain(ctx, rc, lockKey, 3*time.Second, &Options{
+		Watchdog: NewTickWatchdog(1000 * time.Millisecond),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(5 * time.Second)
+
+	// check TTL
+	assertTTL(t, lock, 3*time.Second)
+
+	err = lock.Release(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// try releasing
+	if exp, got := ErrNotObtained, lock.Refresh(ctx, time.Minute, nil); !errors.Is(got, exp) {
+		t.Fatalf("expected %v, got %v", exp, got)
+	}
+}
+
 func TestObtain_custom_token(t *testing.T) {
 	lockKey := getLockKey()
 	ctx := context.Background()
