@@ -1,6 +1,6 @@
-module github.com/bsm/redislock
+module github.com/WqyJh/redislock
 
-go 1.17
+go 1.22.6
 
 require github.com/redis/go-redis/v9 v9.0.3
 
